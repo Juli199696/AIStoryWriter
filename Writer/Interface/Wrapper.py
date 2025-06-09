@@ -151,30 +151,139 @@ class Interface:
 
         return NewMsg
 
-
-
-    def SafeGenerateJSON(self, _Logger, _Messages, _Model:str, _SeedOverride:int = -1, _RequiredAttribs:list = []):
-
-        while True:
-            Response = self.SafeGenerateText(_Logger, _Messages, _Model, _SeedOverride, _Format = "JSON")
+    def SafeGenerateJSON(self, _Logger, _Messages, _Model: str, _SeedOverride: int = -1, _RequiredAttribs: list = []):
+        max_retries = 5
+        retry_count = 0
+        
+        while retry_count < max_retries:
             try:
-
-                # Check that it returned valid json
-                JSONResponse = json.loads(self.GetLastMessageText(Response))
-
-                # Now ensure it has the right attributes
+                # Generate response with JSON format
+                Response = self.SafeGenerateText(_Logger, _Messages, _Model, _SeedOverride, _Format="json")
+                raw_response = self.GetLastMessageText(Response)
+                
+                # Debug logging
+                _Logger.Log(f"Raw JSON Response (attempt {retry_count + 1}): '{raw_response[:200]}{'...' if len(raw_response) > 200 else ''}'", 5)
+                _Logger.Log(f"Response Length: {len(raw_response)}", 5)
+                
+                # Check if response is empty
+                if not raw_response or raw_response.strip() == "":
+                    _Logger.Log("Empty response from AI model", 7)
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        # Remove the failed attempt and try again
+                        del _Messages[-1]
+                        continue
+                    else:
+                        _Logger.Log("Max retries exceeded for empty response", 7)
+                        return Response, {}
+                
+                # Clean the response
+                cleaned_response = raw_response.strip()
+                
+                # Remove markdown code blocks if present
+                if "```json" in cleaned_response:
+                    start = cleaned_response.find("```json") + 7
+                    end = cleaned_response.find("```", start)
+                    if end != -1:
+                        cleaned_response = cleaned_response[start:end].strip()
+                elif "```" in cleaned_response:
+                    start = cleaned_response.find("```") + 3
+                    end = cleaned_response.find("```", start)
+                    if end != -1:
+                        cleaned_response = cleaned_response[start:end].strip()
+                
+                # Remove any remaining backticks and "json" text
+                cleaned_response = cleaned_response.replace("`", "").replace("json", "").strip()
+                
+                # Find JSON object boundaries
+                json_start = cleaned_response.find('{')
+                if json_start == -1:
+                    json_start = cleaned_response.find('[')
+                
+                if json_start != -1:
+                    # Find the matching closing bracket
+                    if cleaned_response[json_start] == '{':
+                        bracket_count = 0
+                        json_end = -1
+                        for i in range(json_start, len(cleaned_response)):
+                            if cleaned_response[i] == '{':
+                                bracket_count += 1
+                            elif cleaned_response[i] == '}':
+                                bracket_count -= 1
+                                if bracket_count == 0:
+                                    json_end = i + 1
+                                    break
+                    elif cleaned_response[json_start] == '[':
+                        bracket_count = 0
+                        json_end = -1
+                        for i in range(json_start, len(cleaned_response)):
+                            if cleaned_response[i] == '[':
+                                bracket_count += 1
+                            elif cleaned_response[i] == ']':
+                                bracket_count -= 1
+                                if bracket_count == 0:
+                                    json_end = i + 1
+                                    break
+                    
+                    if json_end != -1:
+                        cleaned_response = cleaned_response[json_start:json_end]
+                
+                _Logger.Log(f"Cleaned JSON Response: '{cleaned_response[:200]}{'...' if len(cleaned_response) > 200 else ''}'", 5)
+                
+                # Try to parse JSON
+                JSONResponse = json.loads(cleaned_response)
+                
+                # Check for required attributes
+                missing_attribs = []
                 for _Attrib in _RequiredAttribs:
-                    JSONResponse[_Attrib]
-
-                # Now return the json
+                    if _Attrib not in JSONResponse:
+                        missing_attribs.append(_Attrib)
+                
+                if missing_attribs:
+                    _Logger.Log(f"Missing required attributes: {missing_attribs}", 7)
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        # Add feedback about missing attributes
+                        error_msg = f"Your JSON response is missing the required fields: {', '.join(missing_attribs)}. Please include all required fields."
+                        _Messages.append(self.BuildUserQuery(error_msg))
+                        continue
+                    else:
+                        _Logger.Log("Max retries exceeded for missing attributes", 7)
+                        # Return partial JSON if possible
+                        return Response, JSONResponse
+                
+                # Success!
+                _Logger.Log("Successfully parsed JSON response", 5)
                 return Response, JSONResponse
-
+                
+            except json.JSONDecodeError as e:
+                _Logger.Log(f"JSON parsing error (attempt {retry_count + 1}): {e}", 7)
+                _Logger.Log(f"Failed to parse: '{cleaned_response[:500]}{'...' if len(cleaned_response) > 500 else ''}'", 7)
+                
+                retry_count += 1
+                if retry_count < max_retries:
+                    # Remove the failed attempt and add feedback
+                    del _Messages[-1]
+                    error_msg = f"Your response could not be parsed as JSON. Error: {e}. Please respond with valid JSON only, no additional text."
+                    _Messages.append(self.BuildUserQuery(error_msg))
+                    continue
+                else:
+                    _Logger.Log("Max retries exceeded for JSON parsing", 7)
+                    return Response, {}
+                    
             except Exception as e:
-                _Logger.Log(f"JSON Error during parsing: {e}", 7)
-                del _Messages[-1] # Remove failed attempt
-                Response = self.ChatAndStreamResponse(_Logger, _Messages, _Model, random.randint(0, 99999), _Format = "JSON")
-
-
+                _Logger.Log(f"Unexpected error in SafeGenerateJSON (attempt {retry_count + 1}): {e}", 7)
+                retry_count += 1
+                if retry_count < max_retries:
+                    del _Messages[-1]
+                    continue
+                else:
+                    _Logger.Log("Max retries exceeded for unexpected error", 7)
+                    return Response, {}
+        
+        # If we get here, all retries failed
+        _Logger.Log("All JSON generation attempts failed", 7)
+        return _Messages, {}
 
     def ChatAndStreamResponse(
         self,
